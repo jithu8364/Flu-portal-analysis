@@ -1,0 +1,230 @@
+import pandas as pd
+import numpy as np
+import re
+
+
+# Load  data 
+
+
+# List of variables to analyze (including gender)
+variables = [****list***
+    
+]
+
+# Debug: Inspect dataset
+print("Dataset shape:", data.shape)
+print("Column names in dataset:", data.columns.tolist())
+
+# Check if testing_date exists
+if 'testing_date' not in data.columns:
+    print(" Skipping date filtering.")
+    data_filtered = data.copy()
+else:
+    # Convert 'testing_date' column to datetime (Excel serial numbers)
+    try:
+        data['testing_date'] = pd.to_datetime(
+            pd.to_numeric(data['testing_date'], errors='coerce'),
+            unit='D',
+            origin='1899-12-30',
+            errors='coerce'
+        )
+    except Exception as e:
+        print(f"\nError converting 'testing_date' to datetime: {e}")
+        data['testing_date'] = pd.to_datetime(data['testing_date'], errors='coerce', format='mixed')
+
+    # Define the date range
+    start_date = pd.to_datetime('2022-11-01')
+    end_date = pd.to_datetime('2025-04-30')
+
+    # Filter data by date range
+    data_filtered = data[
+        (data['testing_date'] >= start_date) &
+        (data['testing_date'] <= end_date)
+    ].copy()
+
+
+# Normalize column names
+data_filtered.columns = data_filtered.columns.str.strip().str.lower()
+if 'sample_source' in data_filtered.columns:
+    data_filtered['sample_source'] = data_filtered['sample_source'].str.strip().str.lower()
+
+# Update 'for community settings' to 'for hospital settings' if hospitalized
+if 'sample_source' in data_filtered.columns and 'date_of_hospitalize' in data_filtered.columns:
+    data_filtered.loc[
+        (data_filtered['sample_source'] == 'for community settings') &
+        (data_filtered['date_of_hospitalize'].notnull()),
+        'sample_source'
+    ] = 'for hospital settings'
+
+# Clean 'age' column
+def clean_age(age, ymd):
+    if pd.isna(age) or str(age).strip() == '':
+        return pd.NA
+    age_str = str(age).strip().lower()
+    if age_str in ['9999', 'unknown', 'na', 'n/a']:
+        return pd.NA
+    if age_str in ['0', 'newborn', 'neonate', 'infant']:
+        return 0
+    try:
+        num = float(re.sub(r'[^\d.]', '', age_str))
+    except ValueError:
+        return pd.NA
+    return num
+
+# Apply cleaning
+if 'age' in data_filtered.columns and 'ymd' in data_filtered.columns:
+    data_filtered['age_cleaned'] = [clean_age(age, ymd) for age, ymd in zip(data_filtered['age'], data_filtered['ymd'])]
+
+# Normalize 'ymd' values
+if 'ymd' in data_filtered.columns:
+    data_filtered['ymd'] = data_filtered['ymd'].str.lower().replace({
+        'year': 'years', 'yrs': 'years', 'y': 'years',
+        'month': 'months', 'm': 'months', 'mo': 'months',
+        'day': 'days', 'd': 'days', 'days': 'days',
+        'week': 'weeks', 'w': 'weeks', 'wk': 'weeks', 'weeks': 'weeks',
+        ' ': None, '': None, None: None
+    })
+
+def convert_to_years(row):
+    if pd.isna(row['age_cleaned']) or pd.isna(row['ymd']):
+        return pd.NA
+    age = row['age_cleaned']
+    if row['ymd'] == 'years':
+        return age
+    elif row['ymd'] == 'months':
+        return age / 12
+    elif row['ymd'] == 'days':
+        return age / 365
+    elif row['ymd'] == 'weeks':
+        return age / 52
+    return pd.NA
+
+if 'age_cleaned' in data_filtered.columns and 'ymd' in data_filtered.columns:
+    data_filtered['age_in_years'] = data_filtered.apply(convert_to_years, axis=1)
+
+def categorize_age(age):
+    if pd.isna(age) or not isinstance(age, (int, float, np.floating, np.integer)) or age < 0:
+        return 'Missing Age'
+    elif age < 1:
+        return '<1'
+    elif 1 <= age < 5:
+        return '1 to 4'
+    elif 5 <= age < 18:
+        return '5 to <17'
+    elif 18 <= age < 45:
+        return '18 to 44'
+    elif 45 <= age < 60:
+        return '45 to 59'
+    else:
+        return '60 and above'
+
+if 'age_in_years' in data_filtered.columns:
+    data_filtered['age_group'] = data_filtered['age_in_years'].apply(categorize_age)
+
+# Add pregnancy for females only, avoid double append
+if ('pregnancy' in data_filtered.columns and
+    'gender' in data_filtered.columns and
+    'pregnancy' not in variables):
+    pregnancy_female = data_filtered[data_filtered['gender'].apply(lambda x: str(x).strip().lower()) == 'female'].copy()
+    pregnancy_female['pregnancy'] = pregnancy_female['pregnancy'].apply(
+        lambda x: 'Yes' if str(x).strip().lower() in ['yes', 'y', '1'] else 'No'
+    )
+    data_filtered.loc[pregnancy_female.index, 'pregnancy'] = pregnancy_female['pregnancy']
+    variables.append('pregnancy')
+
+def normalize_response(x):
+    if pd.isna(x):
+        return 'Missing'
+    x = str(x).strip().lower()
+    if x in ['yes', 'y', '1', 'true', 'positive']:
+        return 'Yes'
+    elif x in ['no', 'n', '0', 'false', 'negative']:
+        return 'No'
+    elif x in ['male', 'm']:
+        return 'Male'
+    elif x in ['female', 'f']:
+        return 'Female'
+    else:
+        return 'Missing'
+
+for col in variables:
+    if col in data_filtered.columns:
+        data_filtered[col] = data_filtered[col].apply(normalize_response)
+
+hospital_data = data_filtered[data_filtered['sample_source'] == 'for hospital settings'] if 'sample_source' in data_filtered.columns else pd.DataFrame()
+community_data = data_filtered[data_filtered['sample_source'] == 'for community settings'] if 'sample_source' in data_filtered.columns else pd.DataFrame()
+
+hospital_total = len(hospital_data)
+community_total = len(community_data)
+
+age_groups = ['<1', '1 to 4', '5 to <17', '18 to 44', '45 to 59', '60 and above', 'Missing Age']
+
+result_data = []
+for var in variables:
+    if var in data_filtered.columns and var not in ['discharged_alive', 'death', 'not_known']:
+        if var == 'gender':
+            for category in ['Male', 'Female']:
+                hospital_count = hospital_data[var].value_counts().get(category, 0)
+                hospital_pct = (hospital_count / hospital_total * 100) if hospital_total > 0 else 0
+                community_count = community_data[var].value_counts().get(category, 0)
+                community_pct = (community_count / community_total * 100) if community_total > 0 else 0
+                result_data.append({
+                    'Characteristics': f"Gender: {category}",
+                    f'Community Settings (n={community_total})': f"{community_count} ({community_pct:.2f}%)",
+                    f'Hospital Settings (n={hospital_total})': f"{hospital_count} ({hospital_pct:.2f}%)"
+                })
+        else:
+            hospital_yes = hospital_data[var].value_counts().get('Yes', 0)
+            hospital_pct = (hospital_yes / hospital_total * 100) if hospital_total > 0 else 0
+            community_yes = community_data[var].value_counts().get('Yes', 0)
+            community_pct = (community_yes / community_total * 100) if community_total > 0 else 0
+            result_data.append({
+                'Characteristics': var.replace('_', ' ').title(),
+                f'Community Settings (n={community_total})': f"{community_yes} ({community_pct:.2f}%)",
+                f'Hospital Settings (n={hospital_total})': f"{hospital_yes} ({hospital_pct:.2f}%)"
+            })
+
+# Add age groups
+if 'age_group' in data_filtered.columns:
+    for age_group in age_groups:
+        hospital_count = hospital_data['age_group'].value_counts().get(age_group, 0)
+        hospital_pct = (hospital_count / hospital_total * 100) if hospital_total > 0 else 0
+        community_count = community_data['age_group'].value_counts().get(age_group, 0)
+        community_pct = (community_count / community_total * 100) if community_total > 0 else 0
+        result_data.append({
+            'Characteristics': f"Age Group (years): {age_group}",
+            f'Community Settings (n={community_total})': f"{community_count} ({community_pct:.2f}%)",
+            f'Hospital Settings (n={hospital_total})': f"{hospital_count} ({hospital_pct:.2f}%)"
+        })
+
+# ---- CORRECT OUTCOME LOGIC ----
+def outcome_category(row):
+    if str(row.get('discharged_alive', '')).strip().lower() == 'yes':
+        return "Discharged Alive"
+    elif str(row.get('death', '')).strip().lower() == 'yes':
+        return "Death"
+    elif str(row.get('not_known', '')).strip().lower() == 'yes':
+        return "Not Known"
+    else:
+        return "Outcome Missing"
+
+if not hospital_data.empty:
+    hospital_data['outcome_summary'] = hospital_data.apply(outcome_category, axis=1)
+    outcome_counts = hospital_data['outcome_summary'].value_counts()
+    outcome_percents = (outcome_counts / hospital_total * 100).round(2)
+
+    result_data = [row for row in result_data if row['Characteristics'] not in [
+        'Discharged Alive', 'Death', 'Not Known', 'Outcome Missing'
+    ]]
+    # Add new mutually exclusive outcome summary rows
+    for outcome in ['Discharged Alive', 'Death', 'Not Known', 'Outcome Missing']:
+        count = outcome_counts.get(outcome, 0)
+        pct = outcome_percents.get(outcome, 0)
+        result_data.append({
+            'Characteristics': outcome,
+            f'Community Settings (n={community_total})': '',
+            f'Hospital Settings (n={hospital_total})': f"{count} ({pct:.2f}%)"
+        })
+
+result_table = pd.DataFrame(result_data)
+

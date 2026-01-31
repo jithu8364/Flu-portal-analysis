@@ -1,0 +1,436 @@
+
+# COMORBIDITIES vs HOSPITAL OUTCOMES — ANY YES / ANY NO ONLY
+
+
+import pandas as pd
+from scipy.stats import chi2_contingency
+hospital = data[data["sample_source"] == "Hospital"].copy()
+
+comorb_cols = [****list of comorbidities variables from flu data***]
+    
+
+# ------------------------------
+# 3. Outcome columns
+# ------------------------------
+outcomes = {
+    "ICU": "admitted_in_icu",
+    "Discharged Alive": "discharged_alive",
+    "Death": "death",
+    "Not Known": "not_known"
+}
+
+
+# 4. Convert comorbidities + outcomes to 0/1
+
+def to_binary(x):
+    return 1 if str(x).lower() in ["yes"] else 0
+
+for col in comorb_cols:
+    hospital[col] = hospital[col].fillna(0).apply(to_binary)
+
+for col in outcomes.values():
+    hospital[col] = hospital[col].fillna(0).apply(to_binary)
+
+# ------------------------------
+# 5. Create ANY YES / ANY NO
+# ------------------------------
+hospital["ANY_YES"] = hospital[comorb_cols].max(axis=1)
+hospital["ANY_NO"] = (hospital["ANY_YES"] == 0).astype(int)
+
+# ------------------------------
+# 6. Chi-square helper
+# ------------------------------
+def outcome_pvalue(group_col, outcome_col):
+    table = pd.crosstab(hospital[group_col], hospital[outcome_col])
+    if table.shape != (2, 2):
+        return ""
+    chi2, p, dof, exp = chi2_contingency(table)
+    return f"{p:.3f}"
+
+# ------------------------------
+# 7. Build final table
+# ------------------------------
+rows = []
+
+for label, flag in [("ANY YES", "ANY_YES"), ("ANY NO", "ANY_NO")]:
+    sub = hospital[hospital[flag] == 1]
+    total = len(sub)
+
+    row = [label, total]
+
+    for out_label, out_col in outcomes.items():
+        count = sub[out_col].sum() if total else 0
+        pct = (count / total * 100) if total else 0
+        row.append(f"{count} ({pct:.1f}%)")
+
+    rows.append(row)
+
+# ---- p-value row (ONE per outcome) ----
+p_row = ["p-value", ""]
+
+for out_label, out_col in outcomes.items():
+    p_row.append(outcome_pvalue("ANY_YES", out_col))
+
+rows.append(p_row)
+
+final_table = pd.DataFrame(
+    rows,
+    columns=["Group", "Samples tested"] + list(outcomes.keys())
+)
+
+# ------------------------------
+# 8. Print results
+# ------------------------------
+print("\n======================================================")
+print(" COMORBIDITIES vs OUTCOMES — ANY YES vs ANY NO (Hospital)")
+print("======================================================")
+print(final_table.to_string(index=False))
+
+
+
+
+
+
+# SARI OUTCOME MODEL: Alive vs Dead
+# Unadjusted + Adjusted OR 
+# Includes: Age, Sex, Any Comorbidity, Severity, Treatment, Pathogen
+
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import re
+
+df['ymd'] = df['ymd'].astype(str).str.lower()
+
+def clean_age(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).lower().strip()
+    if s in ['na','n/a','unknown','']:
+        return np.nan
+    try:
+        return float(re.sub(r'[^\d.]','', s))
+    except:
+        return np.nan
+
+df['age_clean'] = df['age'].apply(clean_age)
+
+def to_years(r):
+    if pd.isna(r['age_clean']) or pd.isna(r['ymd']):
+        return np.nan
+    if 'year' in r['ymd']:
+        return r['age_clean']
+    if 'month' in r['ymd']:
+        return r['age_clean'] / 12
+    if 'week' in r['ymd']:
+        return r['age_clean'] / 52
+    if 'day' in r['ymd']:
+        return r['age_clean'] / 365
+    return np.nan
+
+df['age_years'] = df.apply(to_years, axis=1)
+
+
+sari = df[
+    df['sample_source'].astype(str).str.lower().str.contains('hospital')
+].copy()
+
+
+sari['death'] = yes_no(sari['death'])
+sari['alive'] = yes_no(sari['discharged_alive'])
+
+sari = sari[(sari['death']==1) | (sari['alive']==1)].copy()
+sari['outcome_dead'] = (sari['death']==1).astype(int)
+
+
+sari['infA'] = yes_no(sari['influenza_a'])
+sari['infB'] = yes_no(sari['influenza_b'])
+sari['covid'] = yes_no(sari['sarscov2'])
+
+sari = sari[sari[['infA','infB','covid']].sum(axis=1) == 1].copy()
+
+# ============================================================
+# 7. PATHOGEN
+# ============================================================
+sari['pathogen'] = np.select(
+    [sari['infA']==1, sari['infB']==1, sari['covid']==1],
+    ['InfluenzaA','InfluenzaB','SARSCoV2']
+)
+
+pathogen_dummies = pd.get_dummies(
+    sari['pathogen'], drop_first=True
+)
+
+
+# 8. AGE GROUPS (<5 reference, 5–64, ≥65)
+
+sari['age_group'] = pd.cut(
+    sari['age_years'],
+    [-np.inf, 4.999, 64.999, np.inf],
+    labels=['<5','5–64','≥65']
+)
+
+age_dummies = pd.get_dummies(
+    sari['age_group'], prefix='Age', drop_first=True
+)
+
+sari['male'] = (
+    sari['gender']
+    .astype(str)
+    .str.lower()
+    .isin(['male','m'])
+).astype(int)
+
+
+comorb_cols = [
+    
+]
+
+comorb_cols = [c for c in comorb_cols if c in sari.columns]
+
+for c in comorb_cols:
+    sari[c] = yes_no(sari[c])
+
+sari['any_comorbidity'] = (
+    sari[comorb_cols]
+    .fillna(0)
+    .max(axis=1)
+)
+
+ ============================================================
+sari['icu'] = yes_no(sari['admitted_in_icu'])
+
+sari['any_oxygen'] = (
+    yes_no(sari['oxygen']).fillna(0) |
+    yes_no(sari['cpap']).fillna(0) |
+    yes_no(sari['ventilation']).fillna(0)
+).astype(int)
+
+sari['antivirals'] = yes_no(sari['antivirals'])
+sari['antibiotics'] = yes_no(sari['antibiotics'])
+
+
+predictors = (
+    list(age_dummies.columns) +
+    ['male','any_comorbidity','icu','any_oxygen',
+     'antivirals','antibiotics'] +
+    list(pathogen_dummies.columns)
+)
+
+
+unadj = []
+
+design_all = pd.concat([
+    sari[['outcome_dead']],
+    age_dummies,
+    sari[['male','any_comorbidity','icu','any_oxygen',
+          'antivirals','antibiotics']],
+    pathogen_dummies
+], axis=1)
+
+for var in predictors:
+    tmp = design_all[['outcome_dead', var]].dropna()
+    if tmp[var].nunique() < 2:
+        continue
+
+    X = sm.add_constant(tmp[[var]]).astype(float)
+    y = tmp['outcome_dead']
+
+    res = sm.Logit(y, X).fit(disp=False)
+
+    unadj.append([
+        var,
+        np.exp(res.params[var]),
+        *np.exp(res.conf_int().loc[var]),
+        res.pvalues[var]
+    ])
+
+unadj = pd.DataFrame(
+    unadj, columns=['Variable','OR','LCL','UCL','p']
+)
+
+
+X = pd.concat([
+    age_dummies,
+    sari[['male','any_comorbidity','icu','any_oxygen',
+          'antivirals','antibiotics']],
+    pathogen_dummies
+], axis=1).astype(float)
+
+X = sm.add_constant(X)
+y = sari['outcome_dead']
+
+mask = X.notnull().all(axis=1) & y.notnull()
+X = X.loc[mask]
+y = y.loc[mask]
+
+adj_res = sm.Logit(y, X).fit(disp=False)
+
+adj = pd.DataFrame({
+    'Variable': adj_res.params.index,
+    'Adj_OR': np.exp(adj_res.params),
+    'Adj_LCL': np.exp(adj_res.conf_int()[0]),
+    'Adj_UCL': np.exp(adj_res.conf_int()[1]),
+    'Adj_p': adj_res.pvalues
+}).query("Variable != 'const'")
+
+
+final = unadj.merge(adj, on='Variable')
+
+final['Unadjusted OR (95% CI)'] = (
+    final['OR'].round(2).astype(str) + " (" +
+    final['LCL'].round(2).astype(str) + "–" +
+    final['UCL'].round(2).astype(str) + ")"
+)
+
+final['Adjusted OR (95% CI)'] = (
+    final['Adj_OR'].round(2).astype(str) + " (" +
+    final['Adj_LCL'].round(2).astype(str) + "–" +
+    final['Adj_UCL'].round(2).astype(str) + ")"
+)
+
+def fmt_p(p):
+    if p < 0.001:
+        return "<0.001 *"
+    elif p < 0.05:
+        return f"{p:.3f} *"
+    else:
+        return f"{p:.3f}"
+
+final['p-value'] = final['p'].apply(fmt_p)
+final['Adj p-value'] = final['Adj_p'].apply(fmt_p)
+
+# ============================================================
+# 16. SAVE OUTPUT
+# ============================================================
+output_file = "SARI_Outcome_Alive_vs_Dead_Unadj_Adj.xlsx"
+
+final[
+    ['Variable',
+     'Unadjusted OR (95% CI)', 'p-value',
+     'Adjusted OR (95% CI)', 'Adj p-value']
+].to_excel(output_file, index=False)
+
+print(f"\nSaved file: {output_file}")
+print("\nSARI Outcome (Dead vs Alive): Unadjusted & Adjusted\n")
+print(
+    final[
+        ['Variable',
+         'Unadjusted OR (95% CI)', 'p-value',
+         'Adjusted OR (95% CI)', 'Adj p-value']
+    ].to_string(index=False)
+)
+
+
+
+# SARI – PREGNANT vs NON-PREGNANT WOMEN (FEMALES ONLY)
+
+
+import pandas as pd
+import numpy as np
+from scipy.stats import chi2_contingency, fisher_exact
+
+
+sari_female = data[
+    (data['sample_source'].astype(str).str.lower().str.contains('hospital')) &
+    (data['gender'].astype(str).str.lower() == 'female')
+].copy()
+
+
+def yes_no(s):
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.lower()
+        .map({'yes':1,'no':0})
+    )
+
+
+sari_female['pregnant'] = yes_no(sari_female['pregnancy'])
+
+sari_female['Influenza A'] = yes_no(sari_female['influenza_a'])
+sari_female['Influenza B'] = yes_no(sari_female['influenza_b'])
+sari_female['SARSCoV2'] = yes_no(sari_female['sarscov2'])
+
+sari_female['Death'] = yes_no(sari_female['death'])
+sari_female['Discharged Alive'] = yes_no(sari_female['discharged_alive'])
+sari_female['ICU'] = yes_no(sari_female['admitted_in_icu'])
+
+sari_female['Any Oxygen support'] = (
+    yes_no(sari_female['oxygen']).fillna(0) |
+    yes_no(sari_female['cpap']).fillna(0) |
+    yes_no(sari_female['ventilation']).fillna(0)
+).astype(int)
+
+# ============================================================
+# 4. SPLIT GROUPS AFTER VARIABLES EXIST
+# ============================================================
+preg = sari_female[sari_female['pregnant'] == 1]
+nonpreg = sari_female[sari_female['pregnant'] == 0]
+
+# ============================================================
+# 5. FUNCTION TO COMPUTE P-VALUE
+# ============================================================
+def compare_groups(var):
+    table = pd.crosstab(sari_female['pregnant'], sari_female[var])
+    if table.shape != (2,2):
+        return np.nan
+    if (table.values < 5).any():
+        _, p = fisher_exact(table)
+    else:
+        _, p, _, _ = chi2_contingency(table)
+    return p
+
+# ============================================================
+# 6. BUILD FINAL TABLE
+# ============================================================
+rows = []
+
+variables = [
+    'Influenza A',
+    'Influenza B',
+    'SARSCoV2',
+    'Death',
+    'Discharged Alive',
+    'ICU',
+    'Any Oxygen support'
+]
+
+for var in variables:
+    preg_yes = preg[var].sum()
+    preg_n = preg.shape[0]
+
+    nonpreg_yes = nonpreg[var].sum()
+    nonpreg_n = nonpreg.shape[0]
+
+    pval = compare_groups(var)
+
+    rows.append([
+        var,
+        f"{preg_yes}/{preg_n} ({preg_yes/preg_n*100:.1f}%)" if preg_n > 0 else "NA",
+        f"{nonpreg_yes}/{nonpreg_n} ({nonpreg_yes/nonpreg_n*100:.1f}%)" if nonpreg_n > 0 else "NA",
+        "<0.001" if pval < 0.001 else f"{pval:.3f}"
+    ])
+
+final_table = pd.DataFrame(
+    rows,
+    columns=[
+        'Variable',
+        'Pregnant women',
+        'Non-pregnant women',
+        'P-value'
+    ]
+)
+
+
+output_file = "SARI_Female_Pregnant_vs_NonPregnant.xlsx"
+final_table.to_excel(output_file, index=False)
+
+print(f"\nSaved file: {output_file}\n")
+print(final_table.to_string(index=False))
+
+
+
+
+

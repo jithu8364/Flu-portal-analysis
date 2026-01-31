@@ -1,0 +1,285 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+
+
+required_columns = ['testing_date', 'sample_source', 'influenza_a', 'influenza_b']
+missing_columns = [col for col in required_columns if col not in data.columns]
+if missing_columns:
+    print(f"Warning: Missing columns: {missing_columns}. Please check column names.")
+    exit()
+
+print(f"Total rows before any filtering: {len(data)}")
+print("Sample source counts before filtering (with NaN):")
+print(data['sample_source'].value_counts(dropna=False))
+print(f"Missing testing_date before filter: {data['testing_date'].isna().sum()}")
+
+# Convert testing_date to datetime (Excel serial numbers)
+try:
+    data['testing_date'] = pd.to_datetime(data['testing_date'], unit='D', origin='1899-12-30', errors='coerce')
+except Exception as e:
+    print(f"Error converting 'testing_date' to datetime: {e}")
+    print("Sample of testing_date:", data['testing_date'].head().tolist())
+    exit()
+
+# Debug: After date conversion
+print(f"\nNumber of rows with invalid dates: {data['testing_date'].isna().sum()}")
+print("Missing testing_date by sample_source:")
+print(data[data['testing_date'].isna()]['sample_source'].value_counts(dropna=False))
+
+# Drop rows with invalid dates
+data = data.dropna(subset=['testing_date'])
+
+# Filter data for November 2022 to April 2025
+start_date = pd.to_datetime('2022-11-01')
+end_date = pd.to_datetime('2025-04-30')
+pre_filter_count = len(data)
+data = data[(data['testing_date'] >= start_date) & (data['testing_date'] <= end_date)].copy()
+
+# Debug: Rows excluded by date filter
+out_of_range = data[(data['testing_date'] < start_date) | (data['testing_date'] > end_date) | data['testing_date'].isna()]
+print("\nRows excluded by date filter (outside range or NaT) by sample_source:")
+print(out_of_range['sample_source'].value_counts(dropna=False))
+
+# Debug: After filtering
+print(f"\nRows before date filter: {pre_filter_count}")
+print(f"Number of rows after date filtering (Nov 2022 - Apr 2025): {len(data)}")
+print(f"Date range after filtering: {data['testing_date'].min()} to {data['testing_date'].max()}")
+print("Sample source counts after date filter:")
+print(data['sample_source'].value_counts(dropna=False))
+
+# Debug: Check for SARI cases in the early period (Nov 2022 to Oct 2023)
+early_data = data[data['testing_date'] < '2023-10-01']
+print(f"\nNumber of rows before Oct 2023: {len(early_data)}")
+print(f"Sample source values before Oct 2023:\n{early_data['sample_source'].value_counts()}")
+
+# Classify cases as SARI or ILI based on sample_source
+data['Case_Type'] = data['sample_source'].map({
+    'For Hospital Settings': 'SARI',
+    'For Community Settings': 'ILI'
+})
+
+# Debug: Check the distribution of Case_Type
+print(f"\nCase Type distribution:\n{data['Case_Type'].value_counts(dropna=False)}")
+
+# Derive samples tested and positives
+data['Sample_Tested'] = data['testing_date'].notna().astype(int)
+data['Sample_Positive'] = (
+    (data['influenza_a'].str.lower().eq('yes')) |
+    (data['influenza_b'].str.lower().eq('yes')) |
+   
+).astype(int)
+
+
+# Debug: Positivity counts
+print("\nPositivity counts:")
+print(f"Influenza A Positive: {data['influenza_a'].str.lower().eq('yes').sum()}")
+print(f"Influenza B Positive: {data['influenza_b'].str.lower().eq('yes').sum()}")
+print(f"Total Positive: {data['Sample_Positive'].sum()}")
+
+# Extract year and week from testing_date
+data['Year'] = data['testing_date'].dt.year
+data['Week'] = data['testing_date'].dt.isocalendar().week
+
+# Debug: Check for any issues with week extraction
+print(f"\nUnique years in data: {data['Year'].unique()}")
+print(f"Week range in data: {data['Week'].min()} to {data['Week'].max()}")
+
+# Create a complete week range from Nov 2022 to Apr 2025
+all_weeks = []
+current_date = start_date
+while current_date <= end_date:
+    year = current_date.year
+    week = current_date.isocalendar().week
+    all_weeks.append((year, week))
+    current_date += pd.Timedelta(days=7)
+all_weeks_df = pd.DataFrame(all_weeks, columns=['Year', 'Week']).drop_duplicates()
+
+# Debug: Check the number of weeks in all_weeks_df
+print(f"Total number of weeks in all_weeks_df: {len(all_weeks_df)}")
+
+# Aggregate data by Year and Week for ILI and SARI separately
+ili_samples = data[data['Case_Type'] == 'ILI'].groupby(['Year', 'Week']).agg({
+    'Sample_Tested': 'sum',
+    'Sample_Positive': 'sum'
+}).reset_index()
+sari_samples = data[data['Case_Type'] == 'SARI'].groupby(['Year', 'Week']).agg({
+    'Sample_Tested': 'sum',
+    'Sample_Positive': 'sum'
+}).reset_index()
+
+# Debug: Check the number of weeks with ILI and SARI data
+print(f"\nNumber of weeks with ILI data: {len(ili_samples)}")
+print(f"Number of weeks with SARI data: {len(sari_samples)}")
+print(f"SARI data before Oct 2023:\n{sari_samples[(sari_samples['Year'] == 2022) | ((sari_samples['Year'] == 2023) & (sari_samples['Week'] <= 40))]}")
+
+# Merge with all_weeks_df to ensure all weeks are present
+ili_samples = all_weeks_df.merge(ili_samples, on=['Year', 'Week'], how='left').fillna(0)
+sari_samples = all_weeks_df.merge(sari_samples, on=['Year', 'Week'], how='left').fillna(0)
+
+# Rename columns
+ili_samples = ili_samples.rename(columns={
+    'Sample_Tested': 'Samples_Tested_ILI',
+    'Sample_Positive': 'Samples_Positive_ILI'
+})
+sari_samples = sari_samples.rename(columns={
+    'Sample_Tested': 'Samples_Tested_SARI',
+    'Sample_Positive': 'Samples_Positive_SARI'
+})
+
+# Merge into a single DataFrame
+surveillance_df = ili_samples.merge(
+    sari_samples[['Year', 'Week', 'Samples_Tested_SARI', 'Samples_Positive_SARI']],
+    on=['Year', 'Week'], how='outer'
+).fillna(0)
+
+# Calculate Proportion Positive for ILI and SARI
+surveillance_df['Proportion_Positive_ILI'] = (surveillance_df['Samples_Positive_ILI'] / surveillance_df['Samples_Tested_ILI'].replace(0, np.nan)) * 100
+surveillance_df['Proportion_Positive_SARI'] = (surveillance_df['Samples_Positive_SARI'] / surveillance_df['Samples_Tested_SARI'].replace(0, np.nan)) * 100
+
+# Debug: Check for missing or NaN values in Proportion_Positive
+print(f"\nNumber of weeks in surveillance_df: {len(surveillance_df)}")
+print(f"Number of NaN values in Proportion_Positive_ILI: {surveillance_df['Proportion_Positive_ILI'].isna().sum()}")
+print(f"Number of NaN values in Proportion_Positive_SARI: {surveillance_df['Proportion_Positive_SARI'].isna().sum()}")
+
+# Add a Date column for accurate week numbering
+surveillance_df['Date'] = surveillance_df.apply(
+    lambda row: pd.to_datetime(f"{int(row['Year'])}-W{int(row['Week'])}-1", format="%Y-W%W-%w"), axis=1
+)
+
+# Calculate Week_Number as the number of weeks since the start date
+surveillance_df['Week_Number'] = ((surveillance_df['Date'] - start_date).dt.days // 7)
+
+# Print all data points for Proportion Positive ILI and SARI
+print("\nAll Data Points for Proportion Positive ILI (Nov 2022 - Apr 2025):")
+print(surveillance_df[['Date', 'Year', 'Week', 'Week_Number', 'Proportion_Positive_ILI']].to_string(index=False))
+
+print("\nAll Data Points for Proportion Positive SARI (Nov 2022 - Apr 2025):")
+print(surveillance_df[['Date', 'Year', 'Week', 'Week_Number', 'Proportion_Positive_SARI']].to_string(index=False))
+
+# Function to calculate WHO thresholds and average epidemic curve
+def calculate_who_thresholds(data, param, years):
+    data = data[data['Year'].isin(years)].copy()
+    yearly_peaks = data.groupby('Year').apply(lambda x: x.loc[x[param].idxmax(), 'Week'] if x[param].max() > 0 else np.nan)
+    yearly_peaks = yearly_peaks.dropna()
+    if len(yearly_peaks) == 0:
+        print(f"Warning: No peak weeks found for {param} in years {years}. Setting default thresholds.")
+        return {'Seasonal': 0, 'Moderate': 0, 'High': 0, 'Alert': 0}, pd.DataFrame({'Aligned_Week': range(52), param: [0]*52})
+    median_peak_week = np.median(yearly_peaks)
+    aligned_data = []
+    for year in years:
+        year_data = data[data['Year'] == year].copy()
+        if year in yearly_peaks.index:
+            peak_week = yearly_peaks[year]
+            shift = int(median_peak_week - peak_week)
+            year_data['Aligned_Week'] = (year_data['Week'] + shift) % 52
+            aligned_data.append(year_data)
+    aligned_df = pd.concat(aligned_data, ignore_index=True) if aligned_data else pd.DataFrame()
+    if aligned_df.empty:
+        avg_curve = pd.DataFrame({'Aligned_Week': range(52), param: [0]*52})
+    else:
+        avg_curve = aligned_df.groupby('Aligned_Week')[param].mean().reindex(range(52), fill_value=0).reset_index()
+    all_weeks = data[param].dropna()
+    if len(all_weeks) == 0:
+        return {'Seasonal': 0, 'Moderate': 0, 'High': 0, 'Alert': 0}, avg_curve
+    seasonal_threshold = np.median(all_weeks)
+    in_season_weeks = data[data[param] > seasonal_threshold][param]
+    moderate_threshold = np.mean(in_season_weeks) if len(in_season_weeks) > 0 else seasonal_threshold
+    high_threshold = avg_curve[param].max()
+    peak_values = aligned_df.groupby('Year')[param].max() if not aligned_df.empty else pd.Series([0])
+    alert_threshold = peak_values.mean() + 1.645 * stats.sem(peak_values, nan_policy='omit') if len(peak_values) > 1 else high_threshold
+    return {
+        'Seasonal': seasonal_threshold,
+        'Moderate': moderate_threshold,
+        'High': high_threshold,
+        'Alert': alert_threshold
+    }, avg_curve
+
+# Define years for threshold setting
+threshold_years = [2022, 2023, 2024]
+
+# Calculate thresholds for Proportion Positive ILI and SARI
+pos_ili_thresholds, pos_ili_curve = calculate_who_thresholds(surveillance_df, 'Proportion_Positive_ILI', threshold_years)
+pos_sari_thresholds, pos_sari_curve = calculate_who_thresholds(surveillance_df, 'Proportion_Positive_SARI', threshold_years)
+
+# Print thresholds
+print("\nProportion Positive ILI Thresholds:", pos_ili_thresholds)
+print("Proportion Positive SARI Thresholds:", pos_sari_thresholds)
+
+# Plot Proportion Positive ILI with raw data and thresholds
+fig, ax1 = plt.subplots(figsize=(14, 6))
+surveillance_df['Proportion_Positive_ILI'] = surveillance_df['Proportion_Positive_ILI'].fillna(0)
+ax1.plot(surveillance_df['Week_Number'], surveillance_df['Proportion_Positive_ILI'], 
+         label='Weekly Data', color='gray', alpha=0.7, marker='o', markersize=4)
+ax1.set_xlabel('Week (Continuous from Nov 2022)')
+ax1.set_ylabel('Proportion Positive ILI (%)', color='black')
+ax1.tick_params(axis='y', labelcolor='black')
+ax1.set_xticks([0, 9, 22, 35, 48, 61, 74, 87, 100, 113, 126])
+ax1.set_xticklabels(['Nov 2022', 'Jan 2023', 'Apr 2023', 'Jul 2023', 'Oct 2023',
+                     'Jan 2024', 'Apr 2024', 'Jul 2024', 'Oct 2024', 'Jan 2025', 'Apr 2025'], rotation=45)
+ax1.axhline(pos_ili_thresholds['Seasonal'], linestyle='--', 
+            label=f'Seasonal ({pos_ili_thresholds["Seasonal"]:.1f}%)', color='green')
+ax1.axhline(pos_ili_thresholds['Moderate'], linestyle='--', 
+            label=f'Moderate ({pos_ili_thresholds["Moderate"]:.1f}%)', color='orange')
+ax1.axhline(pos_ili_thresholds['High'], linestyle='--', 
+            label=f'High ({pos_ili_thresholds["High"]:.1f}%)', color='purple')
+ax1.axhline(pos_ili_thresholds['Alert'], linestyle='--', 
+            label=f'Alert ({pos_ili_thresholds["Alert"]:.1f}%)', color='red')
+ax1.legend(loc='upper right')
+plt.title('Proportion Positive ILI: Weekly Trends and WHO Thresholds (Nov 2022 - Apr 2025)')
+ax1.grid(True)
+plt.tight_layout()
+plt.savefig('proportion_positive_ili.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Plot Proportion Positive SARI with raw data and thresholds
+fig, ax1 = plt.subplots(figsize=(14, 6))
+surveillance_df['Proportion_Positive_SARI'] = surveillance_df['Proportion_Positive_SARI'].fillna(0)
+ax1.plot(surveillance_df['Week_Number'], surveillance_df['Proportion_Positive_SARI'], 
+         label='Weekly Data', color='gray', alpha=0.7, marker='o', markersize=4)
+ax1.set_xlabel('Week (Continuous from Nov 2022)')
+ax1.set_ylabel('Proportion Positive SARI (%)', color='black')
+ax1.tick_params(axis='y', labelcolor='black')
+ax1.set_xticks([0, 9, 22, 35, 48, 61, 74, 87, 100, 113, 126])
+ax1.set_xticklabels(['Nov 2022', 'Jan 2023', 'Apr 2023', 'Jul 2023', 'Oct 2023',
+                     'Jan 2024', 'Apr 2024', 'Jul 2024', 'Oct 2024', 'Jan 2025', 'Apr 2025'], rotation=45)
+ax1.axhline(pos_sari_thresholds['Seasonal'], linestyle='--', 
+            label=f'Seasonal ({pos_sari_thresholds["Seasonal"]:.1f}%)', color='green')
+ax1.axhline(pos_sari_thresholds['Moderate'], linestyle='--', 
+            label=f'Moderate ({pos_sari_thresholds["Moderate"]:.1f}%)', color='orange')
+ax1.axhline(pos_sari_thresholds['High'], linestyle='--', 
+            label=f'High ({pos_sari_thresholds["High"]:.1f}%)', color='purple')
+ax1.axhline(pos_sari_thresholds['Alert'], linestyle='--', 
+            label=f'Alert ({pos_sari_thresholds["Alert"]:.1f}%)', color='red')
+ax1.legend(loc='upper right')
+plt.title('Proportion Positive SARI: Weekly Trends and WHO Thresholds (Nov 2022 - Apr 2025)')
+ax1.grid(True)
+plt.tight_layout()
+plt.savefig('proportion_positive_sari.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Detect seasons (two-consecutive-week rule)
+def detect_seasons(data, param, seasonal_threshold):
+    seasons = []
+    above_threshold = False
+    data = data.sort_values(['Year', 'Week']).reset_index(drop=True)
+    for i in range(1, len(data)):
+        current_val = data[param].iloc[i]
+        prev_val = data[param].iloc[i-1]
+        if pd.notna(current_val) and pd.notna(prev_val):
+            if prev_val > seasonal_threshold and current_val > seasonal_threshold:
+                if not above_threshold:
+                    seasons.append(('Start', data['Year'].iloc[i], data['Week'].iloc[i]))
+                    above_threshold = True
+            elif current_val <= seasonal_threshold and above_threshold:
+                seasons.append(('End', data['Year'].iloc[i], data['Week'].iloc[i]))
+                above_threshold = False
+    return seasons
+
+# Detect seasons for Proportion Positive ILI and SARI
+pos_ili_seasons = detect_seasons(surveillance_df, 'Proportion_Positive_ILI', pos_ili_thresholds['Seasonal'])
+pos_sari_seasons = detect_seasons(surveillance_df, 'Proportion_Positive_SARI', pos_sari_thresholds['Seasonal'])
+
+print("\nProportion Positive ILI Seasons (Two-Consecutive-Week Rule):", pos_ili_seasons)
+print("Proportion Positive SARI Seasons (Two-Consecutive-Week Rule):", pos_sari_seasons)

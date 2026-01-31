@@ -1,0 +1,218 @@
+import pandas as pd
+import numpy as np
+import re
+
+# Check for required columns
+required_columns = [
+    'influenza_a', 'ah1n1pdm09', 'h3n2', 'unsubtypable',
+    'influenza_b', 'victoria', 'yamagata', 'lineages_not_determine',
+    'testing_date', 'sample_source', 'age', 'ymd', 'sarscov2'
+]
+missing_columns = [col for col in required_columns if col not in data.columns]
+if missing_columns:
+    print(f"Warning: Missing columns: {missing_columns}. Please check column names.")
+    exit()
+
+# Robust date harmonization for mixed types (Excel serial, string, datetime)
+def harmonize_date(val):
+    if pd.isnull(val):
+        return pd.NaT
+    if isinstance(val, pd.Timestamp):
+        return val
+    if isinstance(val, (int, float)):
+        try:
+            return pd.to_datetime(val, unit='D', origin='1899-12-30')
+        except Exception:
+            return pd.NaT
+    try:
+        return pd.to_datetime(val)
+    except Exception:
+        return pd.NaT
+
+data['testing_date'] = data['testing_date'].apply(harmonize_date)
+invalid_dates = data['testing_date'].isna().sum()
+if invalid_dates > 0:
+    print(f"Warning: {invalid_dates} rows have invalid or missing dates in 'testing_date'.")
+
+# Normalize 'ymd' values
+data['ymd'] = data['ymd'].str.lower().replace({
+    'year': 'years', 'yrs': 'years', 'y': 'years',
+    'month': 'months', 'm': 'months', 'mo': 'months',
+    'day': 'days', 'd': 'days', 'days': 'days',
+    'week': 'weeks', 'w': 'weeks', 'wk': 'weeks', 'weeks': 'weeks',
+    ' ': None, '': None, None: None
+})
+
+# Clean 'age' column, prioritizing dataset's ymd
+def clean_age(age, ymd):
+    if pd.isna(age) or str(age).strip() == '':
+        return pd.NA
+    age_str = str(age).strip().lower()
+    if age_str in ['9999', 'unknown', 'na', 'n/a']:
+        return pd.NA
+    if age_str in ['0', 'newborn', 'neonate', 'infant']:
+        return 0
+    try:
+        num = float(re.sub(r'[^\d.]', '', age_str))
+    except ValueError:
+        return pd.NA
+    return num
+
+data['age_cleaned'] = [clean_age(age, ymd) for age, ymd in zip(data['age'], data['ymd'])]
+
+# Convert age to years
+def convert_to_years(row):
+    if pd.isna(row['age_cleaned']) or pd.isna(row['ymd']):
+        return pd.NA
+    age = row['age_cleaned']
+    if row['ymd'] == 'years':
+        return age
+    elif row['ymd'] == 'months':
+        return age / 12
+    elif row['ymd'] == 'days':
+        return age / 365
+    elif row['ymd'] == 'weeks':
+        return age / 52
+    return pd.NA
+
+data['age_in_years'] = data.apply(convert_to_years, axis=1)
+
+# Filter data for November 2022 to April 2025
+data = data[(data['testing_date'] >= pd.to_datetime('2022-11-01')) & 
+            (data['testing_date'] <= pd.to_datetime('2025-04-30'))].copy()
+
+# Define positivity columns
+data['influenza_a_positive'] = data['influenza_a'].str.lower().eq('yes').astype(int)
+data['h1_positive'] = data['ah1n1pdm09'].str.lower().eq('yes').astype(int)
+data['h3_positive'] = data['h3n2'].str.lower().eq('yes').astype(int)
+data['unsubtypable_positive'] = data['unsubtypable'].str.lower().eq('yes').astype(int)
+data['influenza_a_unstypable'] = (
+    (data['influenza_a_positive'] == 1) & 
+    (data['h1_positive'] == 0) & 
+    (data['h3_positive'] == 0) & 
+    (data['unsubtypable_positive'] == 1)
+).astype(int)
+data['influenza_a_subtyping_not_done'] = (
+    (data['influenza_a_positive'] == 1) & 
+    (data['h1_positive'] == 0) & 
+    (data['h3_positive'] == 0) & 
+    (data['unsubtypable_positive'] == 0)
+).astype(int)
+
+data['influenza_b_positive'] = data['influenza_b'].str.lower().eq('yes').astype(int)
+data['victoria_positive'] = data['victoria'].str.lower().eq('yes').astype(int)
+data['yamagata_positive'] = data['yamagata'].str.lower().eq('yes').astype(int)
+data['lineages_not_determined'] = data['lineages_not_determine'].str.lower().eq('yes').astype(int)
+data['influenza_b_subtyping_not_done'] = (
+    (data['influenza_b_positive'] == 1) & 
+    (data['victoria_positive'] == 0) & 
+    (data['yamagata_positive'] == 0) & 
+    (data['lineages_not_determined'] == 0)
+).astype(int)
+
+data['AH1N1pdm09_Positive'] = data['h1_positive']
+data['H3N2_Positive'] = data['h3_positive']
+data['Victoria_Positive'] = data['victoria_positive']
+data['SARS_COV_2_Positive'] = data['sarscov2'].str.lower().isin(['yes', 'y', 'positive', 'pos']).astype(int)
+
+# Any positive (including SARS-CoV-2, excluding RSV)
+data['Any_Positive'] = ((data['AH1N1pdm09_Positive'] == 1) | (data['H3N2_Positive'] == 1) |
+                        (data['Victoria_Positive'] == 1) | (data['SARS_COV_2_Positive'] == 1)).astype(int)
+
+# Define age groups
+age_bins = [0, 1, 5, 18, 45, 65, float('inf')]
+age_labels = ['<1 year', '1 to <5 years', '5 to <18 years', '18 to <45 years', '45 to <65 years', '65 above']
+
+# Handle NaN values before pd.cut
+data['Age_Group'] = 'Missing Age'
+valid_ages = data['age_in_years'].notna()
+data.loc[valid_ages, 'Age_Group'] = pd.cut(
+    data.loc[valid_ages, 'age_in_years'],
+    bins=age_bins,
+    labels=age_labels,
+    right=False,
+    include_lowest=True
+).astype(str)
+
+# Split data with case-insensitive sample_source
+community_data = data[data['sample_source'].str.strip().str.lower() == 'for community settings'].copy()
+hospital_data = data[data['sample_source'].str.strip().str.lower() == 'for hospital settings'].copy()
+
+def calculate_age_distribution(df, sample_type):
+    total_counts = df.groupby('Age_Group', observed=False).size()
+    total_samples = len(df)
+    any_positive_counts = df[df['Any_Positive'] == 1].groupby('Age_Group', observed=False).size()
+    ah1n1_counts = df[df['AH1N1pdm09_Positive'] == 1].groupby('Age_Group', observed=False).size()
+    h3n2_counts = df[df['H3N2_Positive'] == 1].groupby('Age_Group', observed=False).size()
+    victoria_counts = df[df['Victoria_Positive'] == 1].groupby('Age_Group', observed=False).size()
+    sarscov2_counts = df[df['SARS_COV_2_Positive'] == 1].groupby('Age_Group', observed=False).size()
+
+    # Reindex to all groups + Total
+    all_labels = age_labels + ['Missing Age', 'Total']
+    total_counts = total_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+    any_positive_counts = any_positive_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+    ah1n1_counts = ah1n1_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+    h3n2_counts = h3n2_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+    victoria_counts = victoria_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+    sarscov2_counts = sarscov2_counts.reindex(age_labels + ['Missing Age'], fill_value=0)
+
+    # Calculate percentages
+    total_percentages = (total_counts / total_samples * 100).round(2)
+    any_positivity_rates = (any_positive_counts / total_counts.replace(0, np.nan) * 100).round(2).fillna(0)
+    ah1n1_rates = (ah1n1_counts / total_counts.replace(0, np.nan) * 100).round(2).fillna(0)
+    h3n2_rates = (h3n2_counts / total_counts.replace(0, np.nan) * 100).round(2).fillna(0)
+    victoria_rates = (victoria_counts / total_counts.replace(0, np.nan) * 100).round(2).fillna(0)
+    sarscov2_rates = (sarscov2_counts / total_counts.replace(0, np.nan) * 100).round(2).fillna(0)
+
+    # Add Total row
+    total_counts = pd.concat([total_counts, pd.Series([total_samples], index=['Total'])])
+    any_positive_counts = pd.concat([any_positive_counts, pd.Series([df['Any_Positive'].sum()], index=['Total'])])
+    ah1n1_counts = pd.concat([ah1n1_counts, pd.Series([df['AH1N1pdm09_Positive'].sum()], index=['Total'])])
+    h3n2_counts = pd.concat([h3n2_counts, pd.Series([df['H3N2_Positive'].sum()], index=['Total'])])
+    victoria_counts = pd.concat([victoria_counts, pd.Series([df['Victoria_Positive'].sum()], index=['Total'])])
+    sarscov2_counts = pd.concat([sarscov2_counts, pd.Series([df['SARS_COV_2_Positive'].sum()], index=['Total'])])
+    total_percentages = pd.concat([total_percentages, pd.Series([100.00], index=['Total'])])
+    any_positivity_rates = pd.concat([any_positivity_rates, pd.Series([(df['Any_Positive'].sum() / total_samples * 100)], index=['Total'])])
+    ah1n1_rates = pd.concat([ah1n1_rates, pd.Series([(df['AH1N1pdm09_Positive'].sum() / total_samples * 100)], index=['Total'])])
+    h3n2_rates = pd.concat([h3n2_rates, pd.Series([(df['H3N2_Positive'].sum() / total_samples * 100)], index=['Total'])])
+    victoria_rates = pd.concat([victoria_rates, pd.Series([(df['Victoria_Positive'].sum() / total_samples * 100)], index=['Total'])])
+    sarscov2_rates = pd.concat([sarscov2_rates, pd.Series([(df['SARS_COV_2_Positive'].sum() / total_samples * 100)], index=['Total'])])
+
+    # Combine counts and rates
+    any_positive_combined = [f"{count} ({rate:.1f}%)" if count > 0 else "0 (0.0%)" 
+                            for count, rate in zip(any_positive_counts, any_positivity_rates)]
+    ah1n1_combined = [f"{count} ({rate:.1f}%)" if count > 0 else "0 (0.0%)" 
+                      for count, rate in zip(ah1n1_counts, ah1n1_rates)]
+    h3n2_combined = [f"{count} ({rate:.1f}%)" if count > 0 else "0 (0.0%)" 
+                     for count, rate in zip(h3n2_counts, h3n2_rates)]
+    victoria_combined = [f"{count} ({rate:.1f}%)" if count > 0 else "0 (0.0%)" 
+                        for count, rate in zip(victoria_counts, victoria_rates)]
+    sarscov2_combined = [f"{count} ({rate:.1f}%)" if count > 0 else "0 (0.0%)" 
+                        for count, rate in zip(sarscov2_counts, sarscov2_rates)]
+
+    # Create result table
+    result_table = pd.DataFrame({
+        'Age Group': total_counts.index,
+        'Total Samples': total_counts.values,
+        f'{sample_type} (%)': [f"{count} ({pct:.1f}%)" for count, pct in zip(total_counts, total_percentages)],
+        'Any Positive': any_positive_combined,
+        'AH1N1pdm09 Positive': ah1n1_combined,
+        'H3N2 Positive': h3n2_combined,
+        'Victoria Positive': victoria_combined,
+        'SARS-CoV-2 Positive': sarscov2_combined
+    })
+
+    return result_table
+
+# Calculate and export tables
+community_table = calculate_age_distribution(community_data, 'Community Samples')
+hospital_table = calculate_age_distribution(hospital_data, 'Hospital Samples')
+
+print("\nAge-wise Distribution and Positivity in Community Samples:")
+print(community_table.to_string(index=False))
+print("\nAge-wise Distribution and Positivity in Hospital Samples:")
+print(hospital_table.to_string(index=False))
+
+community_table.to_csv('community_age_distribution.csv', index=False)
+hospital_table.to_csv('hospital_age_distribution.csv', index=False)
+print("\nTables saved as 'community_age_distribution.csv' and 'hospital_age_distribution.csv'")
